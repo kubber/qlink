@@ -535,12 +535,12 @@ default_user = root
 def usage():
     print(f"""{APP} - quick ssh launcher
 
-  {APP}              open the table
-  {APP} <key|name>   connect straight away (shortcut key, name, or prefix)
-  {APP} -l           list hosts
-  {APP} -c           probe every host and print what qlink sees
-  {APP} -e           open the config in $EDITOR
-  {APP} -h           this help
+  {APP}                open the table
+  {APP} <key|name>     connect straight away (shortcut key, name, or prefix)
+  {APP} -l, --list     list hosts
+  {APP} -c, --check    probe every host and print what qlink sees
+  {APP} -e, --edit     open the config in $VISUAL / $EDITOR (default vim)
+  {APP} -h, --help     this help
 
 config, first that exists:
   $QLINK_CONFIG
@@ -559,6 +559,7 @@ def main(argv):
         usage()
         return 0
 
+    editing = bool(args) and args[0] in ("-e", "--edit")
     cfg = find_config()
     if not cfg:
         cfg = os.path.expanduser("~/.config/qlink/qlink.conf")
@@ -566,10 +567,12 @@ def main(argv):
         with open(cfg, "w", encoding="utf-8") as fh:
             fh.write(SAMPLE)
         print(f"created starter config at {cfg} - edit it, then run {APP} again")
-        return 0
+        if not editing:
+            return 0
 
-    if args and args[0] in ("-e", "--edit"):
-        return subprocess.call([os.environ.get("EDITOR", "vi"), cfg])
+    if editing:
+        editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vim"
+        return subprocess.call(shlex.split(editor) + [cfg])
 
     hosts, errors, _settings = load_hosts(cfg)
     for e in errors:

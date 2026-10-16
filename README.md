@@ -206,7 +206,7 @@ qlink 2          # connect by shortcut key
 qlink lgforms_2  # ...or by name / unique prefix
 qlink -l         # list hosts
 qlink -c         # probe every host, print up/unreachable, exit 1 if any are down
-qlink -e         # edit the config in $EDITOR
+qlink --edit     # edit the config (-e; uses $VISUAL/$EDITOR, default vim)
 qlink -h         # help
 ```
 
