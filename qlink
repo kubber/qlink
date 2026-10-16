@@ -1,0 +1,621 @@
+#!/usr/bin/env python3
+"""qlink - a tiny ssh launcher with a browsable, searchable table.
+
+Config format (CSV-ish, one host per line):
+
+    key,name,user@host,port,description
+
+  key         shortcut, a single digit or letter (press it to connect)
+  name        label shown in the table
+  user@host   hostname or ip, optionally prefixed with user@
+  port        optional, defaults to 22
+  description optional free text (may contain commas)
+
+A line of the form `default_user = someone` sets the user for every entry
+below it that has no user@ of its own.
+
+Lines starting with # and blank lines are ignored.
+"""
+
+import curses
+import errno
+import os
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+APP = "qlink"
+DEFAULT_PORT = "22"
+CHECK_TIMEOUT = 1.5   # seconds per host
+CHECK_WORKERS = 8     # concurrent probes
+RESERVED_KEYS = set("qjkgrc/")  # table navigation, cannot be host shortcuts
+
+# macOS Local Network privacy denies LAN sockets to an unapproved binary with an
+# instant EHOSTUNREACH, which would make every 192.168.x.x host look dead. When
+# we see that, fall back to /usr/bin/nc, which carries its own permission.
+BLOCKED = {errno.EHOSTUNREACH, errno.ENETUNREACH, errno.EACCES, errno.EPERM}
+
+CONFIG_PATHS = [
+    os.environ.get("QLINK_CONFIG"),
+    os.path.expanduser("~/.config/qlink/qlink.conf"),
+    os.path.expanduser("~/.qlink.conf"),
+    os.path.join(os.path.dirname(os.path.realpath(__file__)), "qlink.conf"),
+]
+
+
+class Host:
+    __slots__ = ("key", "name", "user", "host", "port", "desc")
+
+    def __init__(self, key, name, user, host, port, desc):
+        self.key = key
+        self.name = name
+        self.user = user
+        self.host = host
+        self.port = port or DEFAULT_PORT
+        self.desc = desc
+
+    @property
+    def target(self):
+        return f"{self.user}@{self.host}" if self.user else self.host
+
+    @property
+    def haystack(self):
+        return " ".join((self.key, self.name, self.user, self.host,
+                         self.port, self.desc)).lower()
+
+    def ssh_cmd(self):
+        cmd = ["ssh"]
+        if self.port and self.port != DEFAULT_PORT:
+            cmd += ["-p", self.port]
+        cmd.append(self.target)
+        return cmd
+
+
+class Checker:
+    """Probes hosts on background daemon threads. Nothing here ever blocks the
+    UI: results land in a dict, the table redraws when they do, and quitting
+    never waits for a probe."""
+
+    PENDING, UP, DOWN = None, True, False
+
+    def __init__(self, mode="tcp"):
+        self.mode = mode          # tcp | ping | off
+        self.status = {}          # target key -> PENDING / UP / DOWN
+        self._lock = threading.Lock()
+        self._sockets_work = True  # flipped off if the OS blocks our sockets
+
+    @staticmethod
+    def key(hst):
+        return f"{hst.host}:{hst.port}"
+
+    def get(self, hst):
+        return self.status.get(self.key(hst), self.PENDING)
+
+    def busy(self):
+        return self.mode != "off" and any(v is self.PENDING for v in self.status.values())
+
+    def start(self, hosts, force=False):
+        """Queue probes and return immediately - the dispatch itself is threaded
+        so even a long host list cannot delay the first paint."""
+        if self.mode == "off":
+            return
+        todo = []
+        with self._lock:
+            for hst in hosts:
+                k = self.key(hst)
+                if force or k not in self.status:
+                    self.status[k] = self.PENDING
+                    todo.append((k, hst.host, hst.port))
+        if todo:
+            threading.Thread(target=self._dispatch, args=(todo,), daemon=True).start()
+
+    def _dispatch(self, todo):
+        sem = threading.Semaphore(CHECK_WORKERS)
+        for item in todo:
+            sem.acquire()
+            threading.Thread(target=self._probe, args=(item, sem), daemon=True).start()
+
+    def _probe(self, item, sem):
+        k, host, port = item
+        try:
+            ok = self._ping(host) if self.mode == "ping" else self._tcp(host, port)
+        except Exception:
+            ok = False
+        finally:
+            sem.release()
+        self.status[k] = self.UP if ok else self.DOWN
+
+    def _tcp(self, host, port):
+        if not self._sockets_work:
+            return self._nc(host, port)
+        try:
+            with socket.create_connection((host, int(port)), CHECK_TIMEOUT):
+                return True
+        except ValueError:
+            return False
+        except OSError as exc:
+            if exc.errno in BLOCKED and shutil.which("nc"):
+                self._sockets_work = False   # use nc from here on
+                return self._nc(host, port)
+            return False
+
+    @staticmethod
+    def _nc(host, port):
+        secs = max(1, int(round(CHECK_TIMEOUT)))
+        cmd = ["nc", "-z"]
+        if sys.platform == "darwin":
+            cmd += ["-G", str(secs)]         # connect timeout, BSD nc only
+        cmd += ["-w", str(secs), host, str(port)]
+        try:
+            return subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL,
+                                  timeout=secs + 2).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            return False
+
+    @staticmethod
+    def _ping(host):
+        cmd = ["ping", "-c", "1", "-n", "-W", str(int(CHECK_TIMEOUT * 1000)), host]
+        try:
+            return subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL,
+                                  timeout=CHECK_TIMEOUT + 1).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            return False
+
+
+def find_config():
+    for path in CONFIG_PATHS:
+        if path and os.path.isfile(path):
+            return path
+    return None
+
+
+def load_hosts(path):
+    hosts, errors = [], []
+    settings = {"check": os.environ.get("QLINK_CHECK", "tcp").lower()}
+    default_user = os.environ.get("QLINK_USER", "")
+    with open(path, encoding="utf-8") as fh:
+        for lineno, raw in enumerate(fh, 1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "," not in line and "=" in line:  # directive, e.g. default_user = q
+                name_, _, value = line.partition("=")
+                setting = name_.strip().lower()
+                if setting in ("default_user", "user"):
+                    default_user = value.strip()
+                elif setting == "check":
+                    val = value.strip().lower()
+                    if val in ("tcp", "ping", "off"):
+                        settings["check"] = val
+                    else:
+                        errors.append(f"{path}:{lineno}: check must be tcp, ping or off")
+                else:
+                    errors.append(f"{path}:{lineno}: unknown setting -> {line}")
+                continue
+            # maxsplit keeps commas inside the description intact
+            parts = [p.strip() for p in line.split(",", 4)]
+            while len(parts) < 5:
+                parts.append("")
+            key, name, host, port, desc = parts
+            user = default_user
+            if "@" in host:
+                user, _, host = host.rpartition("@")
+                user = user.strip()
+            host = host.strip()
+            if not host:
+                errors.append(f"{path}:{lineno}: missing host -> {line}")
+                continue
+            if not key:
+                key = str(len(hosts) + 1)
+            hosts.append(Host(key, name or host, user, host, port, desc))
+    seen = {}
+    for hst in hosts:
+        low = hst.key.lower()
+        if low in seen:
+            errors.append(f"{path}: shortcut {hst.key!r} used twice "
+                          f"({seen[low]} and {hst.name})")
+        seen[low] = hst.name
+        if low in RESERVED_KEYS:
+            errors.append(f"{path}: shortcut {hst.key!r} ({hst.name}) is a "
+                          f"reserved key, press enter on the row instead")
+    return hosts, errors, settings
+
+
+def match(hosts, query):
+    tokens = query.lower().split()
+    if not tokens:
+        return list(hosts)
+    return [h for h in hosts if all(t in h.haystack for t in tokens)]
+
+
+def resolve(hosts, needle):
+    """Find one host by shortcut key, exact name, or unique prefix/substring."""
+    n = needle.lower()
+    for h in hosts:
+        if h.key.lower() == n:
+            return h
+    for h in hosts:
+        if h.name.lower() == n:
+            return h
+    found = [h for h in hosts if h.name.lower().startswith(n)] or \
+            [h for h in hosts if n in h.haystack]
+    return found[0] if len(found) == 1 else None
+
+
+# ---------------------------------------------------------------- rendering
+
+def put(win, y, x, text, attr=0):
+    h, w = win.getmaxyx()
+    if y < 0 or y >= h or x >= w:
+        return
+    text = text[: max(0, w - x - 1)]
+    try:
+        win.addstr(y, x, text, attr)
+    except curses.error:
+        pass
+
+
+def fit(text, width):
+    if len(text) <= width:
+        return text.ljust(width)
+    return (text[: max(0, width - 1)] + "…").ljust(width)
+
+
+def draw(stdscr, hosts, shown, sel, top, query, searching, cfg, msg, checker):
+    """Monochrome on purpose: bold for emphasis, dim for grey, reverse for the
+    cursor. The only colour in the program is red for an unreachable host."""
+    stdscr.erase()
+    h, w = stdscr.getmaxyx()
+
+    BOLD = curses.A_BOLD
+    GREY = curses.A_DIM
+    SEL = curses.A_REVERSE
+    RULE = curses.A_UNDERLINE
+    try:
+        RED = curses.color_pair(1) | curses.A_BOLD
+    except curses.error:
+        RED = curses.A_BOLD
+
+    put(stdscr, 0, 0, " " + APP, BOLD)
+    right = f"{len(shown)}/{len(hosts)} hosts  {cfg} "
+    if 2 + len(APP) + len(right) < w - 1:
+        put(stdscr, 0, w - 1 - len(right), right, GREY)
+
+    show_user = any(x.user for x in hosts)
+    show_stat = checker.mode != "off"
+    cols = [("KEY", max(3, min(6, max((len(x.key) for x in hosts), default=3)))),
+            ("NAME", max(8, min(22, max((len(x.name) for x in hosts), default=8))))]
+    if show_user:
+        cols.append(("USER", max(4, min(16, max((len(x.user) for x in hosts), default=4)))))
+    cols.append(("HOST", max(10, min(26, max((len(x.host) for x in hosts), default=10)))))
+    cols.append(("PORT", 5))
+    if show_stat:
+        cols.append(("STATUS", 11))
+
+    xs, x = [], 2
+    for _, cw in cols:
+        xs.append(x)
+        x += cw + 1
+    x_desc = x + 1
+    desc_w = max(0, w - 1 - x_desc)
+
+    def row_text(values, desc):
+        line = "  " + " ".join(fit(v, cw) for v, (_, cw) in zip(values, cols))
+        return line + "  " + (fit(desc, desc_w) if desc_w else "")
+
+    def values_for(hst):
+        vals = [hst.key, hst.name]
+        if show_user:
+            vals.append(hst.user)
+        vals += [hst.host, hst.port]
+        if show_stat:
+            st = checker.get(hst)
+            vals.append("unreachable" if st is Checker.DOWN
+                        else "up" if st is Checker.UP else "\u2026")
+        return vals
+
+    put(stdscr, 1, 0, " " * (w - 1), RULE)
+    put(stdscr, 1, 0, row_text([c for c, _ in cols], "DESCRIPTION"), BOLD | RULE)
+
+    body_top = 2
+    body_h = max(1, h - 4)
+    for i in range(body_h):
+        idx = top + i
+        if idx >= len(shown):
+            break
+        hst = shown[idx]
+        y = body_top + i
+        st = checker.get(hst)
+        line = row_text(values_for(hst), hst.desc)
+        if idx == sel:
+            put(stdscr, y, 0, " " * (w - 1), SEL)
+            put(stdscr, y, 0, line, SEL)
+        else:
+            put(stdscr, y, 0, line)
+            put(stdscr, y, xs[0], fit(hst.key, cols[0][1]), BOLD)
+            if desc_w:
+                put(stdscr, y, x_desc, fit(hst.desc, desc_w), GREY)
+        if show_stat:
+            sx, sw = xs[-1], cols[-1][1]
+            if st is Checker.DOWN:
+                put(stdscr, y, sx, fit("unreachable", sw), RED | (SEL if idx == sel else 0))
+            elif idx != sel:
+                put(stdscr, y, sx, fit("up" if st is Checker.UP else "\u2026", sw), GREY)
+
+    if not shown:
+        put(stdscr, body_top + 1, 2, "no match", GREY)
+
+    status_y, help_y = h - 2, h - 1
+    if msg:
+        put(stdscr, status_y, 0, " " + msg, BOLD)
+    elif searching:
+        put(stdscr, status_y, 0, " /", GREY)
+        put(stdscr, status_y, 2, query, BOLD)
+    elif query:
+        put(stdscr, status_y, 0, " filter: ", GREY)
+        put(stdscr, status_y, 9, query, BOLD)
+        put(stdscr, status_y, 9 + len(query), "   esc clears", GREY)
+
+    if searching:
+        help_txt = " type to filter   enter connect   esc done   ctrl-u clear"
+    else:
+        help_txt = (" enter/key connect   \u2191\u2193 jk move   / search   "
+                    "c recheck   r reload   q quit")
+    put(stdscr, help_y, 0, help_txt, GREY)
+
+    if searching:
+        try:
+            curses.curs_set(1)
+            stdscr.move(status_y, min(w - 1, 2 + len(query)))
+        except curses.error:
+            pass
+    else:
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+
+    stdscr.refresh()
+
+
+def connect(stdscr, hst):
+    """Drop out of curses and run ssh. Always returns False: when the session
+    ends we leave qlink rather than coming back to the table."""
+    cmd = hst.ssh_cmd()
+    curses.def_prog_mode()
+    curses.endwin()
+    sys.stdout.write("\n\033[1;32m→ %s\033[0m\n\n" % " ".join(shlex.quote(c) for c in cmd))
+    sys.stdout.flush()
+    try:
+        subprocess.call(cmd)
+    except FileNotFoundError:
+        sys.stdout.write("ssh not found in PATH\n")
+    except KeyboardInterrupt:
+        pass
+    # restore the curses mode we saved above so wrapper()'s endwin() can shut
+    # the screen down cleanly; we return False, so the table is never redrawn.
+    curses.reset_prog_mode()
+    stdscr.clear()
+    stdscr.refresh()
+    return False
+
+
+def tui(stdscr, cfg_path):
+    try:
+        curses.use_default_colors()  # keep the terminal's own fg/bg
+        curses.init_pair(1, curses.COLOR_RED, -1)  # the one colour: unreachable
+    except curses.error:
+        pass
+
+    hosts, errors, settings = load_hosts(cfg_path)
+    checker = Checker(settings["check"])
+    checker.start(hosts)
+    query, searching, sel, top = "", False, 0, 0
+    msg = errors[0] if errors else ""
+
+    while True:
+        shown = match(hosts, query)
+        sel = max(0, min(sel, len(shown) - 1))
+        h, _ = stdscr.getmaxyx()
+        body_h = max(1, h - 4)
+        top = max(0, min(top, max(0, len(shown) - body_h)))
+        if sel < top:
+            top = sel
+        elif sel >= top + body_h:
+            top = sel - body_h + 1
+
+        draw(stdscr, hosts, shown, sel, top, query, searching, cfg_path, msg, checker)
+        msg = ""
+
+        # poll only while probes are in flight, then go back to blocking input
+        stdscr.timeout(200 if checker.busy() else -1)
+        try:
+            ch = stdscr.get_wch()
+        except curses.error:
+            continue  # timed out: redraw so new results show up
+        except KeyboardInterrupt:
+            return
+
+        if ch == curses.KEY_RESIZE:
+            continue
+        if ch in (curses.KEY_UP,) or ch == "\x10":
+            sel -= 1
+            continue
+        if ch in (curses.KEY_DOWN,) or ch == "\x0e":
+            sel += 1
+            continue
+        if ch == curses.KEY_NPAGE:
+            sel += body_h
+            continue
+        if ch == curses.KEY_PPAGE:
+            sel -= body_h
+            continue
+        if ch == curses.KEY_HOME:
+            sel = 0
+            continue
+        if ch == curses.KEY_END:
+            sel = len(shown) - 1
+            continue
+        if ch in ("\n", "\r", curses.KEY_ENTER):
+            if shown:
+                if not connect(stdscr, shown[sel]):
+                    return
+                searching = False
+            continue
+        if ch == "\x1b":  # esc
+            if query:
+                query, sel, top = "", 0, 0
+            searching = False
+            continue
+
+        if searching:
+            if ch in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+                query = query[:-1]
+                sel = 0
+            elif ch == "\x15":  # ctrl-u
+                query, sel = "", 0
+            elif isinstance(ch, str) and ch.isprintable():
+                query += ch
+                sel = 0
+            continue
+
+        # normal mode
+        if ch == "/":
+            searching = True
+            continue
+        if ch in ("q", "Q"):
+            return
+        if ch in ("j", "J"):
+            sel += 1
+            continue
+        if ch in ("k", "K"):
+            sel -= 1
+            continue
+        if ch in ("g",):
+            sel = 0
+            continue
+        if ch in ("G",):
+            sel = len(shown) - 1
+            continue
+        if ch in ("r", "R"):
+            hosts, errors, settings = load_hosts(cfg_path)
+            checker.mode = settings["check"]
+            checker.start(hosts, force=True)
+            msg = errors[0] if errors else "reloaded %s" % cfg_path
+            sel, top = 0, 0
+            continue
+        if ch in ("c", "C"):
+            checker.start(hosts, force=True)
+            continue
+        if isinstance(ch, str) and ch.isprintable():
+            hit = next((x for x in hosts if x.key.lower() == ch.lower()), None)
+            if hit:
+                if not connect(stdscr, hit):
+                    return
+            else:
+                query, searching, sel = ch, True, 0
+            continue
+
+
+SAMPLE = """# qlink hosts:  key,name,user@host,port,description
+# default_user applies to any line below that has no user@ of its own
+default_user = root
+
+1,homelab_1,192.168.0.230,22122,internal network
+2,lgforms_2,deploy@10.213.123.12,22122,intentlab (wireguard required)
+"""
+
+
+def usage():
+    print(f"""{APP} - quick ssh launcher
+
+  {APP}              open the table
+  {APP} <key|name>   connect straight away (shortcut key, name, or prefix)
+  {APP} -l           list hosts
+  {APP} -c           probe every host and print what qlink sees
+  {APP} -e           open the config in $EDITOR
+  {APP} -h           this help
+
+config, first that exists:
+  $QLINK_CONFIG
+  ~/.config/qlink/qlink.conf
+  ~/.qlink.conf
+  ./qlink.conf (next to the script)
+
+format: key,name,user@host,port,description   (port defaults to 22)
+        default_user = someone   sets the user for lines without a user@
+        check = tcp|ping|off     background reachability probe (default tcp)""")
+
+
+def main(argv):
+    args = argv[1:]
+    if args and args[0] in ("-h", "--help"):
+        usage()
+        return 0
+
+    cfg = find_config()
+    if not cfg:
+        cfg = os.path.expanduser("~/.config/qlink/qlink.conf")
+        os.makedirs(os.path.dirname(cfg), exist_ok=True)
+        with open(cfg, "w", encoding="utf-8") as fh:
+            fh.write(SAMPLE)
+        print(f"created starter config at {cfg} - edit it, then run {APP} again")
+        return 0
+
+    if args and args[0] in ("-e", "--edit"):
+        return subprocess.call([os.environ.get("EDITOR", "vi"), cfg])
+
+    hosts, errors, _settings = load_hosts(cfg)
+    for e in errors:
+        print("warning:", e, file=sys.stderr)
+    if not hosts:
+        print(f"no hosts in {cfg}", file=sys.stderr)
+        return 1
+
+    if args and args[0] in ("-c", "--check"):
+        checker = Checker(_settings["check"] if _settings["check"] != "off" else "tcp")
+        checker.start(hosts)
+        deadline = time.time() + 15
+        while checker.busy() and time.time() < deadline:
+            time.sleep(0.05)
+        bad = 0
+        for hst in hosts:
+            st = checker.get(hst)
+            label = "up" if st is Checker.UP else "unreachable" if st is Checker.DOWN else "timed out"
+            bad += st is not Checker.UP
+            print(f"{hst.key:>4}  {hst.name:<22} {hst.target}:{hst.port:<8} {label}")
+        via = "nc" if not checker._sockets_work else checker.mode
+        print(f"\n({len(hosts) - bad}/{len(hosts)} reachable, probed with {via})")
+        return 1 if bad else 0
+
+    if args and args[0] in ("-l", "--list"):
+        for hst in hosts:
+            print(f"{hst.key:>4}  {hst.name:<22} {hst.target:<32} {hst.port:<6} {hst.desc}")
+        return 0
+
+    if args:
+        hit = resolve(hosts, args[0])
+        if not hit:
+            print(f"no unique match for {args[0]!r}", file=sys.stderr)
+            return 1
+        cmd = hit.ssh_cmd() + args[1:]
+        os.execvp(cmd[0], cmd)
+
+    if not sys.stdout.isatty():
+        print("not a tty", file=sys.stderr)
+        return 1
+    try:
+        curses.wrapper(tui, cfg)
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

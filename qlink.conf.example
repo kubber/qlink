@@ -1,0 +1,11 @@
+# qlink hosts:  key,name,user@host,port,description
+#
+# default_user applies to every line below it that has no user@ of its own.
+# Uncomment and set it, or put the user on each line: 1,homelab_1,root@192.168.0.230,...
+#default_user = root
+
+1,homelab_1,root@192.168.0.230,22122,internal network
+2,lgforms_2,deploy@10.213.123.12,22122,example (wireguard required)
+
+# reachability probe: tcp (default, connects to the ssh port), ping, or off
+#check = tcp
